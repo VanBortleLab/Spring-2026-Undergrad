@@ -1,0 +1,305 @@
+title: "MCB290 Spring 2026"
+subtitle: "Tumor-specific codon frequencies"
+author: "Riya Sivaraman"
+output:
+html_document:
+toc: true
+toc_float: true
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+echo = TRUE,
+message = FALSE,
+warning = FALSE,
+fig.width = 10,
+fig.height = 7
+)
+```
+```{r load_packages}
+if (!requireNamespace("pheatmap", quietly = TRUE)) install.packages("pheatmap")
+library(pheatmap)
+```
+Section 1. Retrieval of primary tumor RNA-seq data (TCGA)
+
+To begin our tumor-level codon analysis, we are retrieving transcript abundance
+estimates derived from RNA-seq data generated across a variety of primary human
+tumors, as measured by the Cancer Genome Atlas. The values represent normalized
+gene expression estimates quantified using RSEM. Because the data are summarized
+at the gene level with no transcript ID information, we will select one
+representative CDS per gene from Ensembl (see Section 2).
+```{r retrieve_tcga}
+tcga <- readRDS(url("https://github.com/kvbortle/MCB290_VanBortleLab_Undergraduate_Projects/raw/refs/heads/main/data/TCGA_RNASeq_ATACmatch_RSEM.RDS"))
+head(tcga)
+cat("Number of genes in TCGA data:", nrow(tcga), "
+")
+cat("Number of tumor samples: ", ncol(tcga) - 1, "
+")
+```
+Section 2. Build a reference codon key for Ensembl transcripts
+
+Because the TCGA data is gene-level, we pick one representative transcript
+per gene: the longest CDS. The longest CDS typically encodes the most complete
+protein and is the most biologically relevant isoform. The trade-off is that
+isoform switching across tumor types is ignored.
+For each representative CDS we:
+Split the sequence into non-overlapping triplets (codons)
+Count occurrences of each of the 64 possible codons
+Store results in a gene × codon count matrix
+```{r retrieve_ensembl}
+cds <- readRDS(url("https://github.com/kvbortle/MCB290_VanBortleLab_Undergraduate_Projects/raw/refs/heads/main/data/Ensemblv115.CDS.RDS"))
+head(cds)
+```
+```{r build_codon_key}
+── 2a. Select longest CDS per gene ──────────────────────────────────────────
+
+cds$cds_length <- nchar(cds$CDS)
+cds_rep <- cds[order(cds$GeneName, -cds$cds_length), ]
+cds_rep <- cds_rep[!duplicated(cds_rep$GeneName), ]
+cat("Representative transcripts selected:", nrow(cds_rep), "
+")
+── 2b. Define all 64 codons ─────────────────────────────────────────────────
+
+bases <- c("A", "T", "C", "G")
+all_codons <- sort(as.vector(outer(outer(bases, bases, paste0), bases, paste0)))
+cat("Total codons defined:", length(all_codons), "
+")
+── 2c. Function to count codons in a single CDS string ──────────────────────
+
+count_codons <- function(seq) {
+seq <- toupper(seq)
+trimmed_len <- floor(nchar(seq) / 3) * 3
+seq <- substr(seq, 1, trimmed_len)
+starts <- seq(1, trimmed_len - 2, by = 3)
+triplets <- substring(seq, starts, starts + 2)
+counts <- table(factor(triplets, levels = all_codons))
+return(as.integer(counts))
+}
+── 2d. Build gene x codon count matrix ──────────────────────────────────────
+
+cat("Computing per-gene codon counts (this may take ~30-60 seconds)...
+")
+codon_counts_list <- lapply(cds_rep$CDS, count_codons)
+codon_count_mat <- do.call(rbind, codon_counts_list)
+rownames(codon_count_mat) <- cds_rep$GeneName
+colnames(codon_count_mat) <- all_codons
+cat("Codon count matrix dimensions:", dim(codon_count_mat), "
+")
+stopifnot(all(rowSums(codon_count_mat) > 0))
+cat("Sanity check passed: all genes have at least one codon.
+")
+```
+Section 3. Determine codon frequency (%) across each tumor type
+
+Using the RSEM values from Section 1 and the codon key from Section 2, we
+compute expression-weighted codon frequencies for each sample, then average
+within each TCGA tumor type.
+Strategy:
+Align genes shared between TCGA and the codon key
+Use matrix multiplication to compute expression-weighted codon sums per sample
+Normalize to frequencies (%) per sample
+Aggregate per-sample frequencies to per-tumor-type means
+```{r calculate_tumor_codon_freqs}
+── 3a. Align genes ───────────────────────────────────────────────────────────
+
+common_genes <- intersect(tcga$gene, rownames(codon_count_mat))
+cat("Genes in TCGA: ", nrow(tcga), "
+")
+cat("Genes in codon key: ", nrow(codon_count_mat), "
+")
+cat("Genes in common: ", length(common_genes), "
+")
+expr_mat <- as.matrix(tcga[match(common_genes, tcga$gene), -1])
+rownames(expr_mat) <- common_genes
+codon_mat <- codon_count_mat[common_genes, ]
+── 3b. Expression-weighted codon counts per sample ───────────────────────────
+
+t(expr_mat) is (samples x genes); x codon_mat (genes x codons)
+
+= (samples x 64 codons) weighted codon sums
+
+cat("Computing expression-weighted codon sums...
+")
+weighted_codon_counts <- t(expr_mat) %% codon_mat
+cat("Weighted count matrix dimensions:", dim(weighted_codon_counts), "
+")
+── 3c. Convert to frequencies (%) ───────────────────────────────────────────
+
+sample_totals <- rowSums(weighted_codon_counts)
+codon_freq_samples <- sweep(weighted_codon_counts, 1, sample_totals, "/") * 100
+stopifnot(all(abs(rowSums(codon_freq_samples) - 100) < 1e-6))
+cat("Sanity check passed: per-sample frequencies sum to 100%.
+")
+── 3d. Aggregate by tumor type ───────────────────────────────────────────────
+
+sample_names <- rownames(codon_freq_samples)
+tumor_type <- sub("_.", "", sample_names)
+tumor_types_unique <- sort(unique(tumor_type))
+cat("Tumor types and sample counts:
+")
+print(table(tumor_type))
+tumor_codon_freqs <- do.call(rbind, lapply(tumor_types_unique, function(tt) {
+idx <- which(tumor_type == tt)
+if (length(idx) == 1) codon_freq_samples[idx, ] else colMeans(codon_freq_samples[idx, ])
+}))
+rownames(tumor_codon_freqs) <- tumor_types_unique
+cat("
+Final tumor codon frequency matrix:", dim(tumor_codon_freqs), "
+")
+cat(" rows = tumor types, columns = 64 codons
+")
+round(tumor_codon_freqs[1:5, 1:8], 4)
+```
+Section 4. Visualization and comparison
+
+Visualization 1: Tumor vs. normal tissue references
+
+Average codon frequencies across all tumor types are plotted against Shane's
+and Madelyn's normal-tissue references. Points near the diagonal indicate tumor
+codon usage closely resembles normal tissue; deviations indicate tumor-specific
+shifts.
+```{r viz1_scatter, fig.width=12, fig.height=6}
+mean_tumor_freqs <- colMeans(tumor_codon_freqs)
+shared_codons <- intersect(names(mean_tumor_freqs), colnames(shane))
+par(mfrow = c(1, 2), mar = c(5, 5, 4, 2))
+plot(
+colMeans(shane[, shared_codons]),
+mean_tumor_freqs[shared_codons],
+xlab = "Shane — Normal Tissue Codon Freq (%)",
+ylab = "This Study — Tumor Codon Freq (%)",
+main = "Tumor vs. Normal Tissue
+(Shane reference)",
+pch = 19, cex = 0.8, col = "#E74C3C"
+)
+abline(0, 1, lty = 2, col = "grey40")
+r_shane <- round(cor(colMeans(shane[, shared_codons]),
+mean_tumor_freqs[shared_codons]), 3)
+legend("topleft", bty = "n", legend = paste0("r = ", r_shane))
+plot(
+colMeans(madelyn[, shared_codons]),
+mean_tumor_freqs[shared_codons],
+xlab = "Madelyn — Normal Tissue Codon Freq (%)",
+ylab = "This Study — Tumor Codon Freq (%)",
+main = "Tumor vs. Normal Tissue
+(Madelyn reference)",
+pch = 19, cex = 0.8, col = "#3498DB"
+)
+abline(0, 1, lty = 2, col = "grey40")
+r_madelyn <- round(cor(colMeans(madelyn[, shared_codons]),
+mean_tumor_freqs[shared_codons]), 3)
+legend("topleft", bty = "n", legend = paste0("r = ", r_madelyn))
+par(mfrow = c(1, 1), mar = c(5, 4, 4, 2))
+```
+Visualization 2: Heatmap of codon frequencies across tumor types
+
+Codon frequencies are z-scored column-wise so relative enrichment/depletion is
+visible regardless of a codon's absolute baseline frequency. Both rows (tumor
+types) and columns (codons) are hierarchically clustered, revealing groups of
+tumor types with similar codon usage programs.
+```{r viz2_heatmap, fig.width=14, fig.height=8}
+freq_z <- scale(tumor_codon_freqs)
+heat_colors <- colorRampPalette(c("#2166AC", "white", "#B2182B"))(100)
+pheatmap(
+freq_z,
+color = heat_colors,
+clustering_distance_rows = "euclidean",
+clustering_distance_cols = "euclidean",
+clustering_method = "ward.D2",
+fontsize_row = 8,
+fontsize_col = 6,
+main = "Tumor Codon Frequency (z-score)
+across TCGA tumor types",
+border_color = NA,
+angle_col = 45
+)
+```
+Visualization 3: PCA of tumor types by codon frequency profile
+
+PCA reduces the 64-dimensional codon frequency space to 2D. Tumor types that
+cluster together share similar overall codon usage programs. Outliers may
+reflect unusual transcriptome composition.
+```{r viz3_pca, fig.width=9, fig.height=8}
+pca_res <- prcomp(tumor_codon_freqs, center = TRUE, scale. = TRUE)
+pct_var <- round(100 * pca_res$sdev^2 / sum(pca_res$sdev^2), 1)
+n_types <- nrow(tumor_codon_freqs)
+set.seed(42)
+pal <- rainbow(n_types, s = 0.75, v = 0.85)
+par(mar = c(5, 5, 4, 2), xpd = FALSE)
+plot(
+pca_res$x[, 1], pca_res$x[, 2],
+xlab = paste0("PC1 (", pct_var[1], "% variance)"),
+ylab = paste0("PC2 (", pct_var[2], "% variance)"),
+main = "PCA of Tumor Types
+by Codon Frequency Profile",
+pch = 21, bg = pal, cex = 1.8, col = "black"
+)
+text(pca_res$x[, 1], pca_res$x[, 2],
+labels = rownames(tumor_codon_freqs),
+cex = 0.6, pos = 3, col = "grey25")
+```
+Visualization 4: Leucine synonymous codon usage across tumor types
+
+Leucine has 6 synonymous codons (TTA, TTG, CTT, CTC, CTA, CTG). Within each
+sample we compute what fraction of all Leu codons is accounted for by CTG.
+Variation across tumor types reflects differences in tRNA availability and
+translational efficiency.
+```{r viz4_leu_boxplot, fig.width=11, fig.height=6}
+leu_codons <- intersect(c("TTA", "TTG", "CTT", "CTC", "CTA", "CTG"),
+colnames(codon_freq_samples))
+leu_data <- codon_freq_samples[, leu_codons]
+leu_row_totals <- rowSums(leu_data)
+leu_rscu <- sweep(leu_data, 1, leu_row_totals, "/") * 100
+ctg_vals <- leu_rscu[, "CTG"]
+ctg_by_tumor <- split(ctg_vals, sub("_.", "", names(ctg_vals)))
+med_order <- names(sort(sapply(ctg_by_tumor, median, na.rm = TRUE)))
+ctg_ordered <- ctg_by_tumor[med_order]
+par(mar = c(6, 5, 4, 2))
+boxplot(
+ctg_ordered,
+las = 2,
+col = "#3498DB",
+border = "grey30",
+ylab = "CTG as % of all Leu codons",
+main = "Leucine CTG Synonymous Codon Usage
+across TCGA Tumor Types (ordered by median)",
+cex.axis = 0.65,
+outline = FALSE
+)
+abline(h = mean(ctg_vals, na.rm = TRUE),
+lty = 2, col = "#E74C3C", lwd = 1.5)
+legend("topleft", legend = "Overall mean",
+lty = 2, col = "#E74C3C", lwd = 1.5,
+bty = "n", cex = 0.8)
+par(mar = c(5, 4, 4, 2))
+```
+Visualization 5: Tumor vs. normal tissue codon frequency differences
+
+For each codon we compute: mean tumor frequency − mean normal tissue frequency
+(Shane reference). Red bars indicate codons enriched in tumors; blue bars
+indicate codons depleted relative to normal tissue.
+```{r viz5_delta_barplot, fig.width=12, fig.height=6}
+tissue_mean <- colMeans(shane[, shared_codons])
+tumor_mean <- mean_tumor_freqs[shared_codons]
+delta <- tumor_mean - tissue_mean
+delta_sorted <- sort(delta, decreasing = TRUE)
+par(mar = c(7, 5, 4, 2))
+barplot(
+delta_sorted,
+las = 2,
+col = ifelse(delta_sorted > 0, "#E74C3C", "#3498DB"),
+ylab = "Δ Codon Frequency (Tumor − Normal, %)",
+main = "Tumor vs. Normal Tissue Codon Frequency Differences
+(red = enriched in tumors, blue = depleted)",
+cex.names = 0.6,
+border = NA
+)
+abline(h = 0, col = "black", lwd = 1)
+par(mar = c(5, 4, 4, 2))
+cat("
+Top 5 codons ENRICHED in tumors vs. normal tissue:
+")
+print(round(head(delta_sorted, 5), 4))
+cat("
+Top 5 codons DEPLETED in tumors vs. normal tissue:
+")
+print(round(tail(delta_sorted, 5), 4))
+```
